@@ -167,3 +167,48 @@ def test_store_selects_the_checkpoint_from_all_chunk_states(dim_first, spec_slot
     torch.testing.assert_close(ssm_state[2], varlen_states[3], **exact)
     assert not conv_state[:2].any() and not ssm_storage[:2].any()
     assert not ssm_storage[:, row:].any(), "wrote into the page padding"
+
+
+def test_batched_rows_keep_their_own_states():
+    """With several prefills in one batch, each row's chunks carry only that
+    row's state: every row ends where a solo run ends, and a checkpoint in one
+    row still equals a run over that row's prefix."""
+    lens, chunk_size, n_heads, d_head = [128, 40], 32, 4, 32
+    inputs = generate_random_inputs(1, sum(lens), n_heads, d_head, torch.float32)
+    A, dt, X, B, C = (t.squeeze(0) if t.dim() > 1 else t for t in inputs)
+    cu_seqlens = [0, lens[0], sum(lens)]
+    cu, seq_idx, last, ckpt = compute_chunk_metadata(
+        chunk_size,
+        2,
+        torch.tensor([0, 0]),
+        torch.tensor(cu_seqlens),
+        checkpoint_offsets_p=[48, 0],
+    )
+
+    def int_tensor(values):
+        return torch.tensor(values, dtype=torch.int32, device=DEVICE)
+
+    states = mamba_chunk_scan_combined_varlen(
+        X,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        cu_seqlens=int_tensor(cu_seqlens),
+        cu_chunk_seqlens=int_tensor(cu),
+        last_chunk_indices=int_tensor(last),
+        seq_idx=int_tensor(seq_idx),
+        out=torch.empty_like(X),
+        D=None,
+        return_intermediate_states=True,
+        state_dtype=torch.float32,
+    )
+
+    tol = dict(atol=8e-3, rtol=5e-3)
+    for row, (start, end) in enumerate(zip(cu_seqlens, cu_seqlens[1:])):
+        row_inputs = (A, dt[start:end], X[start:end], B[start:end], C[start:end])
+        solo_final, _ = _run(row_inputs, end - start, chunk_size, 0)
+        torch.testing.assert_close(states[last[row]], solo_final[0], **tol)
+    prefix_final, _ = _run((A, dt, X, B, C), 48, chunk_size, 0)
+    torch.testing.assert_close(states[ckpt[0]], prefix_final[0], **tol)

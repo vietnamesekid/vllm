@@ -2,9 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Internal prefill checkpoints for Mamba2 align-mode prefix caching."""
 
-from types import SimpleNamespace
-
-import pytest
 import torch
 
 from tests.v1.attention.utils import (
@@ -12,8 +9,6 @@ from tests.v1.attention.utils import (
     create_common_attn_metadata,
     create_vllm_config,
 )
-from vllm.model_executor.layers.mamba import mamba_mixer2
-from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.v1.attention.backends.mamba2_attn import (
     Mamba2AttentionMetadataBuilder,
 )
@@ -171,24 +166,3 @@ def test_builder_emits_nothing_outside_align_mode():
     meta = _build(builder, seq_lens=[900], query_lens=[900])
 
     assert meta.checkpoint_chunk_idx is None
-
-
-@pytest.mark.parametrize("is_cpu", [True, False])
-def test_mixer_declares_checkpoint_blocks_only_off_cpu(monkeypatch, is_cpu):
-    """The CPU chunk scan returns only final states, so CPU must not request
-    internal checkpoints; the scheduler then keeps splitting the prefill."""
-    base_spec = MambaSpec(
-        block_size=MAMBA_BLOCK_SIZE,
-        shapes=((16, 64),),
-        dtypes=(torch.float16,),
-        mamba_cache_mode="align",
-    )
-    monkeypatch.setattr(MambaBase, "get_kv_cache_spec", lambda self, cfg: base_spec)
-    monkeypatch.setattr(
-        mamba_mixer2, "current_platform", SimpleNamespace(is_cpu=lambda: is_cpu)
-    )
-    mixer = object.__new__(mamba_mixer2.MambaMixer2)
-
-    spec = mixer.get_kv_cache_spec(None)
-
-    assert spec.num_prefill_checkpoint_blocks == (0 if is_cpu else 1)

@@ -61,23 +61,51 @@ def _mamba_chunk_scan_combined_fwd_cpu(
             d = d.squeeze(-1)
         D_1d = d.contiguous()
 
-    ops.mamba_chunk_scan_fwd_cpu(
-        out,
-        all_states,
-        x,
-        dt_f,
-        A,
-        B,
-        C,
-        D_1d,
-        z,
-        cu_seqlens.to(torch.int32),
-    )
-
     out_dtype = state_dtype if state_dtype is not None else x.dtype
-    all_states = all_states.to(out_dtype)
+    if not return_intermediate_states:
+        ops.mamba_chunk_scan_fwd_cpu(
+            out,
+            all_states,
+            x,
+            dt_f,
+            A,
+            B,
+            C,
+            D_1d,
+            z,
+            cu_seqlens.to(torch.int32),
+        )
+        return all_states.to(out_dtype)
 
-    return all_states
+    # Scan chunk by chunk to return the state at every chunk end.
+    assert cu_chunk_seqlens is not None and seq_idx is not None
+    assert cu_chunk_seqlens.dim() == 1
+    assert seq_idx.numel() == cu_chunk_seqlens.numel() - 1
+    bounds = cu_chunk_seqlens.tolist()
+    chunk_seq = seq_idx.tolist()
+    chunk_states = torch.empty(
+        len(chunk_seq), *all_states.shape[1:], dtype=torch.float32, device=x.device
+    )
+    chunk_range = torch.zeros(2, dtype=torch.int32)
+    for c, b in enumerate(chunk_seq):
+        start, end = bounds[c], bounds[c + 1]
+        state = all_states[b : b + 1]
+        if end > start:
+            chunk_range[1] = end - start
+            ops.mamba_chunk_scan_fwd_cpu(
+                out[start:end],
+                state,
+                x[start:end],
+                dt_f[start:end],
+                A,
+                B[start:end],
+                C[start:end],
+                D_1d,
+                None if z is None else z[start:end],
+                chunk_range,
+            )
+        chunk_states[c] = state[0]
+    return chunk_states.to(out_dtype)
 
 
 def selective_state_update(
@@ -142,3 +170,40 @@ def selective_state_update(
         cu_seqlens,
     )
     return _out.squeeze(1) if out.dim() == 2 else _out
+
+
+def store_prefill_checkpoint(
+    checkpoint,
+    chunk_idx: torch.Tensor,
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    chunk_states: torch.Tensor,
+    ssm_state: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    *,
+    state_len: int,
+) -> None:
+    """CPU implementation for store_prefill_checkpoint."""
+    rows = (checkpoint.checkpoint_offsets > 0).nonzero().flatten()
+    if rows.numel() == 0:
+        return
+    dst = checkpoint.state_indices[rows].long()
+
+    ends = (query_start_loc[rows] + checkpoint.checkpoint_offsets[rows]).long()
+    tokens = ends[:, None] - state_len + torch.arange(state_len)
+    conv_state[dst, :, :state_len] = x[:, tokens].permute(1, 0, 2).to(conv_state.dtype)
+
+    # Copy flat rows from each block start, like the Triton kernel.
+    row_size = chunk_states[0].numel()
+    assert ssm_state[0].numel() >= row_size
+    flat_ssm = ssm_state.as_strided(
+        (ssm_state.size(0), row_size),
+        (ssm_state.stride(0), 1),
+        ssm_state.storage_offset(),
+    )
+    flat_chunks = chunk_states.as_strided(
+        (chunk_states.size(0), row_size),
+        (chunk_states.stride(0), 1),
+        chunk_states.storage_offset(),
+    )
+    flat_ssm[dst] = flat_chunks[chunk_idx[rows].long()].to(ssm_state.dtype)

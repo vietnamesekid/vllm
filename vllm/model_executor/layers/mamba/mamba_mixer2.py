@@ -1095,9 +1095,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         spec = super().get_kv_cache_spec(vllm_config)
-        # The CPU chunk scan cannot export per-chunk states, so CPU keeps the
-        # scheduler-split prefill.
-        if not isinstance(spec, MambaSpec) or current_platform.is_cpu():
+        if not isinstance(spec, MambaSpec):
             return spec
         # The block-boundary state can be exported from inside one forward
         # pass, so the scheduler need not split the prefill; every reader

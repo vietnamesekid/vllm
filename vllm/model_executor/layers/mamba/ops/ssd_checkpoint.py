@@ -116,3 +116,13 @@ def store_prefill_checkpoint(
         SSM_ROW_SIZE=ssm_row_size,
         BLOCK_SIZE=block_size,
     )
+
+
+from vllm.platforms import current_platform  # noqa: E402
+
+if current_platform.is_cpu():
+    from vllm.model_executor.layers.mamba.ops.cpu.mamba_ssm import (
+        store_prefill_checkpoint as store_prefill_checkpoint_cpu,
+    )
+
+    store_prefill_checkpoint = store_prefill_checkpoint_cpu  # type: ignore
